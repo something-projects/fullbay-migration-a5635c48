@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  transformer:
+    build:
+      context: .
+      dockerfile: ./transformer/Dockerfile
+    container_name: transformer
+    environment:
+      # Database connection (direct RDS in VPC for AWS)
+      MYSQL_HOST: ${MYSQL_HOST}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      SSH_TUNNEL: "false"
+      # Application settings
+      OUTPUT_DIR: /app/output
+      PRETTY_JSON: ${PRETTY_JSON:-false}
+      # S3 sync (uses IAM Role on AWS EC2, no credentials needed)
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-fullbay-output}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./output:/app/output
+      - ./customer-output:/app/customer-output
+      - ./autocare-data/VCdb:/app/transformer/autocare-data/VCdb:ro
+      - ./autocare-data/PCdb:/app/transformer/autocare-data/PCdb:ro
+
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    environment:
+      TRANSFORMER_BASE_URL: http://transformer:3001
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./output:/app/output:ro
+    depends_on:
+      - transformer
+
+  onboarding-wizard:
+    build: ./onboarding-wizard
+    container_name: onboarding-wizard
+    environment:
+      PORT: 4005
+      # Transformer API for re-matching
+      TRANSFORMER_API_URL: http://transformer:3001
+      TRANSFORMER_API_TIMEOUT: 30000
+      ENABLE_TRANSFORMER_API: "true"
+      # S3 sync (uses IAM Role on AWS EC2, no credentials needed)
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-fullbay-output}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "4005:4005"   # API server + static UI
+    volumes:
+      - ./output:/app/output:ro
+      - ./customer-output:/app/customer-output
+    depends_on:
+      - transformer
+
+networks:
+  default:
+    name: fullbay

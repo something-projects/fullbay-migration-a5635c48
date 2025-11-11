@@ -1,0 +1,30 @@
+# Docker Compose Local Development Override
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.local.yml up
+#
+# This configuration overrides settings in docker-compose.yml to add local development requirements:
+# - SSH tunnel configuration
+# - AWS static credentials (for local S3 testing)
+
+version: "3.9"
+
+services:
+  transformer:
+    environment:
+      # Override to enable SSH tunnel mode
+      SSH_TUNNEL: "true"
+      SSH_TUNNEL_PORT: ${SSH_TUNNEL_PORT:-55306}
+      REMOTE_HOST: ${REMOTE_HOST}
+      REMOTE_USER: ${REMOTE_USER}
+      SSH_PASSWORD: ${SSH_PASSWORD}
+
+      # Add AWS static credentials for local S3 testing
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+
+  onboarding-wizard:
+    environment:
+      # Add AWS static credentials for local S3 testing
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}

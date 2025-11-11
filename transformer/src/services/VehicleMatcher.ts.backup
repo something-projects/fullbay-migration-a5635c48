@@ -1,0 +1,487 @@
+import {
+  AutoCareData,
+  StandardizedVehicle,
+  VehicleMatchResult,
+  VehicleMatchConfig,
+  VehicleMatchFailureReason,
+  VCdbMake,
+  VCdbModel,
+  VCdbBaseVehicle,
+  VCdbVehicle
+} from '../types/AutoCareTypes';
+import { BaseMatcher, BaseMatchResult } from './base/BaseMatcher';
+import { VehicleConfigurationEnhancer } from './enhancers/VehicleConfigurationEnhancer';
+
+/**
+ * Vehicle Matching Service
+ * 
+ * Matches Fullbay vehicle data (make, model, year) to AutoCare VCdb standards
+ * Supports exact matching, fuzzy matching, and year range tolerance
+ */
+export class VehicleMatcher extends BaseMatcher<VehicleMatchResult, VehicleMatchConfig> {
+  private configurationEnhancer: VehicleConfigurationEnhancer;
+
+  constructor(autoCareData: AutoCareData, config?: Partial<VehicleMatchConfig>) {
+    const defaultConfig: VehicleMatchConfig = {
+      enableFuzzyMatch: true,
+      fuzzyThreshold: 0.8,
+      enableYearRange: true,
+      yearRangeTolerance: 2,
+      enableCache: true,
+      cacheSize: 10000,
+      debugMode: false,
+      ...config
+    };
+    
+    super(autoCareData, defaultConfig);
+    this.configurationEnhancer = new VehicleConfigurationEnhancer(autoCareData);
+  }
+
+  /**
+   * Match vehicle data to AutoCare standards
+   * Uses caching and base matcher functionality
+   */
+  matchVehicle(make?: string, model?: string, year?: number): VehicleMatchResult {
+    const cacheKey = this.getCacheKey(make || '', model || '', year || 0);
+    
+    return this.getFromCacheOrMatch(cacheKey, () => 
+      this.performMatch(make, model, year)
+    );
+  }
+
+  /**
+   * Core matching implementation (used by base class)
+   */
+  protected performMatch(make?: string, model?: string, year?: number): VehicleMatchResult {
+    const originalData = { make, model, year };
+    const attemptedMethods: string[] = [];
+    const searchTerms: string[] = [];
+    const confidenceScores: Record<string, number> = {};
+    
+    let searchAttempts = {
+      make,
+      normalizedMake: make ? this.normalizeName(make) : undefined,
+      model,
+      normalizedModel: model ? this.normalizeName(model) : undefined,
+      year
+    };
+    
+    // Validate input
+    if (!this.validateInput(make, 'make', false) && 
+        !this.validateInput(model, 'model', false) && 
+        !this.validateInput(year, 'year', false)) {
+      return this.createFailureResult(
+        VehicleMatchFailureReason.NO_INPUT_DATA,
+        'No make, model, or year provided for matching',
+        attemptedMethods,
+        searchTerms,
+        confidenceScores,
+        originalData
+      ) as VehicleMatchResult;
+    }
+
+    this.debug(`Matching vehicle: ${make} ${model} ${year}`);
+
+    try {
+      // Try exact match first
+      this.recordAttempt(attemptedMethods, 'exact_match', searchTerms);
+      let result = this.tryExactMatch(make, model, year);
+      
+      if (!result.matched && this.config.enableFuzzyMatch) {
+        // Try fuzzy matching
+        this.recordAttempt(attemptedMethods, 'fuzzy_match', searchTerms);
+        result = this.performFuzzyMatch(make, model, year);
+      }
+
+      this.debug(`Match result: ${result.matched ? 'SUCCESS' : 'NO_MATCH'}`);
+      if (result.standardizedVehicle) {
+        this.debug(`Matched to: ${result.standardizedVehicle.makeName} ${result.standardizedVehicle.modelName} ${result.standardizedVehicle.year} (confidence: ${result.standardizedVehicle.confidence})`);
+      }
+
+      return {
+        ...result,
+        attemptedMethods,
+        searchAttempts,
+        originalData
+      };
+    } catch (error) {
+      console.error('❌ Vehicle matching error:', error);
+      this.recordAttempt(attemptedMethods, 'exception_caught');
+      return this.createFailureResult(
+        VehicleMatchFailureReason.EXCEPTION_ERROR,
+        `Unexpected error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        attemptedMethods,
+        searchTerms,
+        confidenceScores,
+        originalData
+      ) as VehicleMatchResult;
+    }
+  }
+
+  /**
+   * Try exact matching
+   */
+  private tryExactMatch(make?: string, model?: string, year?: number): VehicleMatchResult {
+    const originalData = { make, model, year };
+
+    if (!make) {
+      return { 
+        matched: false, 
+        alternatives: [], 
+        failureReason: VehicleMatchFailureReason.NO_INPUT_DATA,
+        failureDetails: 'Make is required for exact matching',
+        originalData 
+      };
+    }
+
+    const normalizedMake = this.normalizeName(make);
+    const matchedMake = this.autoCareData.vcdb.makesByName.get(normalizedMake);
+    
+    if (!matchedMake) {
+      const availableMakes = Array.from(this.autoCareData.vcdb.makesByName.keys()).slice(0, 5);
+      return { 
+        matched: false, 
+        alternatives: [], 
+        failureReason: VehicleMatchFailureReason.MAKE_NOT_FOUND,
+        failureDetails: `Make '${make}' (normalized: '${normalizedMake}') not found in AutoCare VCdb. Available makes sample: ${availableMakes.join(', ')}`,
+        originalData 
+      };
+    }
+
+    // Find matching models for this make
+    let candidateModels: VCdbModel[] = [];
+    if (model) {
+      const normalizedModel = this.normalizeName(model);
+      candidateModels = this.autoCareData.vcdb.modelsByName.get(normalizedModel) || [];
+      
+      if (candidateModels.length === 0) {
+        // Get sample models for this make to help with debugging
+        const makeBaseVehicles = Array.from(this.autoCareData.vcdb.baseVehicles.values())
+          .filter(bv => bv.MakeID === matchedMake.MakeID).slice(0, 5);
+        const sampleModelIds = makeBaseVehicles.map(bv => bv.ModelID);
+        const sampleModels = sampleModelIds.map(id => this.autoCareData.vcdb.models.get(id)?.ModelName).filter(Boolean);
+        
+        return { 
+          matched: false, 
+          alternatives: [], 
+          failureReason: VehicleMatchFailureReason.MODEL_NOT_FOUND,
+          failureDetails: `Model '${model}' (normalized: '${normalizedModel}') not found for make '${matchedMake.MakeName}'. Sample models for this make: ${sampleModels.join(', ')}`,
+          originalData 
+        };
+      }
+    } else {
+      // If no model specified, get all models for this make from base vehicles
+      const makeBaseVehicles = Array.from(this.autoCareData.vcdb.baseVehicles.values())
+        .filter(bv => bv.MakeID === matchedMake.MakeID);
+      const modelIds = new Set(makeBaseVehicles.map(bv => bv.ModelID));
+      candidateModels = Array.from(modelIds)
+        .map(id => this.autoCareData.vcdb.models.get(id))
+        .filter(m => m) as VCdbModel[];
+    }
+
+    if (candidateModels.length === 0) {
+      return { 
+        matched: false, 
+        alternatives: [], 
+        failureReason: VehicleMatchFailureReason.MODEL_NOT_FOUND,
+        failureDetails: `No models found for make '${matchedMake.MakeName}'`,
+        originalData 
+      };
+    }
+
+    // Find base vehicles for these make/model combinations
+    const candidates: StandardizedVehicle[] = [];
+    let yearRejectedCount = 0;
+    let availableYears: number[] = [];
+    
+    for (const candidateModel of candidateModels) {
+      const baseVehicles = Array.from(this.autoCareData.vcdb.baseVehicles.values())
+        .filter(bv => 
+          bv.MakeID === matchedMake.MakeID && 
+          bv.ModelID === candidateModel.ModelID
+        );
+
+      for (const baseVehicle of baseVehicles) {
+        const vehicleYear = this.autoCareData.vcdb.years.get(baseVehicle.YearID);
+        
+        if (vehicleYear) {
+          availableYears.push(vehicleYear);
+        }
+        
+        // Check year matching
+        if (year && vehicleYear) {
+          const yearDiff = Math.abs(vehicleYear - year);
+          if (yearDiff > (this.config.enableYearRange ? this.config.yearRangeTolerance : 0)) {
+            yearRejectedCount++;
+            continue;
+          }
+        }
+
+        const standardizedVehicle: StandardizedVehicle = {
+          makeId: matchedMake.MakeID,
+          makeName: matchedMake.MakeName,
+          modelId: candidateModel.ModelID,
+          modelName: candidateModel.ModelName,
+          year: vehicleYear || 0,
+          baseVehicleId: baseVehicle.BaseVehicleID,
+          confidence: this.calculateExactMatchConfidence(make, model, year, matchedMake, candidateModel, vehicleYear)
+        };
+
+        // Enhance with detailed configuration if we have VehicleID data
+        this.enhanceWithVehicleConfiguration(standardizedVehicle, baseVehicle);
+        
+        candidates.push(standardizedVehicle);
+      }
+    }
+
+    if (candidates.length === 0) {
+      // Determine the most likely failure reason
+      if (yearRejectedCount > 0 && year) {
+        const uniqueYears = [...new Set(availableYears)].sort((a, b) => a - b);
+        const yearRange = uniqueYears.length > 0 ? `${uniqueYears[0]}-${uniqueYears[uniqueYears.length - 1]}` : 'unknown';
+        return { 
+          matched: false, 
+          alternatives: [], 
+          failureReason: VehicleMatchFailureReason.YEAR_OUT_OF_RANGE,
+          failureDetails: `Year ${year} is outside the available range (${yearRange}) for ${matchedMake.MakeName} ${model || 'models'}. Tolerance: ${this.config.yearRangeTolerance} years`,
+          originalData 
+        };
+      } else {
+        return { 
+          matched: false, 
+          alternatives: [], 
+          failureReason: VehicleMatchFailureReason.NO_BASE_VEHICLE,
+          failureDetails: `No base vehicles found for ${matchedMake.MakeName} ${candidateModels.map(m => m.ModelName).join(', ')}`,
+          originalData 
+        };
+      }
+    }
+
+    // Sort by confidence and return best match
+    candidates.sort((a, b) => b.confidence - a.confidence);
+    
+    return {
+      matched: true,
+      standardizedVehicle: candidates[0],
+      alternatives: candidates.slice(1, 5), // Top 4 alternatives
+      originalData: { make, model, year }
+    };
+  }
+
+  /**
+   * Try fuzzy matching when exact match fails
+   */
+  private performFuzzyMatch(make?: string, model?: string, year?: number): VehicleMatchResult {
+    const originalData = { make, model, year };
+    
+    if (!make) {
+      return { 
+        matched: false, 
+        alternatives: [], 
+        failureReason: VehicleMatchFailureReason.NO_INPUT_DATA,
+        failureDetails: 'Make is required for fuzzy matching',
+        originalData 
+      };
+    }
+
+    const candidates: StandardizedVehicle[] = [];
+
+    // Try fuzzy matching on make names
+    for (const [makeName, makeObj] of this.autoCareData.vcdb.makesByName) {
+      const makeSimilarity = this.calculateSimilarity(this.normalizeName(make), makeName);
+      
+      if (makeSimilarity < this.config.fuzzyThreshold) {
+        continue;
+      }
+
+      // Find models for this make
+      let candidateModels: VCdbModel[] = [];
+      if (model) {
+        // Try fuzzy matching on model names
+        for (const [modelName, models] of this.autoCareData.vcdb.modelsByName) {
+          const modelSimilarity = this.calculateSimilarity(this.normalizeName(model), modelName);
+          if (modelSimilarity >= this.config.fuzzyThreshold) {
+            candidateModels.push(...models);
+          }
+        }
+      } else {
+        // Get all models for this make
+        const makeBaseVehicles = Array.from(this.autoCareData.vcdb.baseVehicles.values())
+          .filter(bv => bv.MakeID === makeObj.MakeID);
+        const modelIds = new Set(makeBaseVehicles.map(bv => bv.ModelID));
+        candidateModels = Array.from(modelIds)
+          .map(id => this.autoCareData.vcdb.models.get(id))
+          .filter(m => m) as VCdbModel[];
+      }
+
+      // Create candidates from base vehicles
+      for (const candidateModel of candidateModels) {
+        const baseVehicles = Array.from(this.autoCareData.vcdb.baseVehicles.values())
+          .filter(bv => 
+            bv.MakeID === makeObj.MakeID && 
+            bv.ModelID === candidateModel.ModelID
+          );
+
+        for (const baseVehicle of baseVehicles) {
+          const vehicleYear = this.autoCareData.vcdb.years.get(baseVehicle.YearID);
+          
+          // Check year matching
+          if (year && vehicleYear) {
+            const yearDiff = Math.abs(vehicleYear - year);
+            if (yearDiff > (this.config.enableYearRange ? this.config.yearRangeTolerance : 0)) {
+              continue;
+            }
+          }
+
+          const confidence = this.calculateFuzzyMatchConfidence(
+            make, model, year, makeObj, candidateModel, vehicleYear, makeSimilarity
+          );
+
+          if (confidence >= this.config.fuzzyThreshold) {
+            const standardizedVehicle: StandardizedVehicle = {
+              makeId: makeObj.MakeID,
+              makeName: makeObj.MakeName,
+              modelId: candidateModel.ModelID,
+              modelName: candidateModel.ModelName,
+              year: vehicleYear || 0,
+              baseVehicleId: baseVehicle.BaseVehicleID,
+              confidence
+            };
+
+            // Enhance with detailed configuration
+            this.enhanceWithVehicleConfiguration(standardizedVehicle, baseVehicle);
+            
+            candidates.push(standardizedVehicle);
+          }
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      return { 
+        matched: false, 
+        alternatives: [], 
+        failureReason: VehicleMatchFailureReason.FUZZY_MATCH_BELOW_THRESHOLD,
+        failureDetails: `No fuzzy matches found above threshold ${this.config.fuzzyThreshold} for make '${make}'${model ? `, model '${model}'` : ''}${year ? `, year ${year}` : ''}`,
+        originalData 
+      };
+    }
+
+    // Sort by confidence and return best match
+    candidates.sort((a, b) => b.confidence - a.confidence);
+    
+    return {
+      matched: candidates[0].confidence >= this.config.fuzzyThreshold,
+      standardizedVehicle: candidates[0],
+      alternatives: candidates.slice(1, 5),
+      originalData: { make, model, year }
+    };
+  }
+
+  /**
+   * Calculate confidence for exact matches
+   */
+  private calculateExactMatchConfidence(
+    originalMake?: string,
+    originalModel?: string,
+    originalYear?: number,
+    matchedMake?: VCdbMake,
+    matchedModel?: VCdbModel,
+    matchedYear?: number
+  ): number {
+    let confidence = 1.0;
+
+    // Slight penalty if any field was missing
+    if (!originalMake) confidence -= 0.1;
+    if (!originalModel) confidence -= 0.1;
+    if (!originalYear) confidence -= 0.1;
+
+    // Bonus for year exact match
+    if (originalYear && matchedYear && originalYear === matchedYear) {
+      confidence = Math.min(1.0, confidence + 0.1);
+    }
+
+    return Math.max(0, confidence);
+  }
+
+  /**
+   * Calculate confidence for fuzzy matches
+   */
+  private calculateFuzzyMatchConfidence(
+    originalMake?: string,
+    originalModel?: string,
+    originalYear?: number,
+    matchedMake?: VCdbMake,
+    matchedModel?: VCdbModel,
+    matchedYear?: number,
+    makeSimilarity?: number
+  ): number {
+    let confidence = makeSimilarity || 0;
+
+    // Factor in model similarity if provided
+    if (originalModel && matchedModel) {
+      const modelSimilarity = this.calculateSimilarity(
+        this.normalizeName(originalModel),
+        this.normalizeName(matchedModel.ModelName)
+      );
+      confidence = (confidence + modelSimilarity) / 2;
+    }
+
+    // Factor in year accuracy
+    if (originalYear && matchedYear) {
+      const yearDiff = Math.abs(originalYear - matchedYear);
+      const yearPenalty = yearDiff * 0.05; // 5% penalty per year difference
+      confidence = Math.max(0, confidence - yearPenalty);
+    }
+
+    return confidence;
+  }
+
+  // Configuration methods are now inherited from BaseMatcher
+
+  /**
+   * Enhance StandardizedVehicle with detailed configuration from VCdb
+   */
+  private enhanceWithVehicleConfiguration(vehicle: StandardizedVehicle, baseVehicle: VCdbBaseVehicle): void {
+    // Find specific VehicleID records for this BaseVehicleID
+    const relatedVehicles = Array.from(this.autoCareData.vcdb.vehicles.values())
+      .filter(v => v.BaseVehicleID === baseVehicle.BaseVehicleID);
+
+    if (relatedVehicles.length > 0) {
+      // Use the first related vehicle for configuration lookup
+      const vcdbVehicle = relatedVehicles[0];
+      vehicle.vehicleId = vcdbVehicle.VehicleID;
+      
+      // Add vehicle type information
+      this.addVehicleTypeInfo(vehicle, baseVehicle);
+      
+      // Add detailed configuration
+      // Use the configuration enhancer for all vehicle configurations
+      this.configurationEnhancer.enhanceVehicle(vehicle, vcdbVehicle);
+      
+      // Add submodel if available
+      if (vcdbVehicle.SubmodelID) {
+        const subModel = this.autoCareData.vcdb.subModels.get(vcdbVehicle.SubmodelID);
+        if (subModel) {
+          vehicle.subModelId = subModel.SubmodelID;
+          vehicle.subModelName = subModel.SubmodelName;
+        }
+      }
+    }
+  }
+
+  /**
+   * Add vehicle type information
+   */
+  private addVehicleTypeInfo(vehicle: StandardizedVehicle, baseVehicle: VCdbBaseVehicle): void {
+    const model = this.autoCareData.vcdb.models.get(baseVehicle.ModelID);
+    if (model && model.VehicleTypeID) {
+      const vehicleType = this.autoCareData.vcdb.vehicleTypes.get(model.VehicleTypeID);
+      if (vehicleType) {
+        vehicle.vehicleTypeId = vehicleType.VehicleTypeID;
+        vehicle.vehicleType = vehicleType.VehicleTypeName;
+      }
+    }
+  }
+
+}
